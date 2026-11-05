@@ -74,7 +74,10 @@ jobs:
           $hash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($joined))).Replace('-', '').Substring(0, 16)
           "key=llvm-ca7933e4-$hash" >> $env:GITHUB_OUTPUT
 
-      - uses: actions/cache@v4
+      # Restored here, saved right after the LLVM step: a later failure must not throw the LLVM build away
+      - name: Restore console LLVM
+        id: llvmcache
+        uses: actions/cache/restore@v4
         with:
           key: ${{ steps.llvmkey.outputs.key }}
           path: |
@@ -91,7 +94,21 @@ jobs:
 
       - name: Step 5 - console LLVM
         working-directory: C:\b\src\rpcs3-ps4
-        run: ./ps4-port/build-llvm.ps1 -Sdk $env:SDK -CompilerBin $env:LLVM_BIN -Jobs 4
+        run: |
+          # prepare-llvm.py writes its record here but does not create the folder (untracked, .gitignore'd)
+          New-Item -ItemType Directory -Force ps4-port/.build-native-package | Out-Null
+          ./ps4-port/build-llvm.ps1 -Sdk $env:SDK -CompilerBin $env:LLVM_BIN -Jobs 4
+
+      - name: Save console LLVM
+        if: steps.llvmcache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          key: ${{ steps.llvmkey.outputs.key }}
+          path: |
+            C:\b\src\rpcs3-ps4\ps4-port\deps\llvm-project-ca7933e47d3a3451d81e72ac174dcb5aa28b59d1
+            C:\b\src\rpcs3-ps4\ps4-port\deps\llvm-project-ca7933e47d3a3451d81e72ac174dcb5aa28b59d1.tar.gz
+            C:\b\src\rpcs3-ps4\ps4-port\.build-llvm-host
+            C:\b\src\rpcs3-ps4\ps4-port\.build-llvm-orbis
 
       - name: Step 6 - configure and build the native ELF
         working-directory: C:\b\src\rpcs3-ps4
