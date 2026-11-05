@@ -496,6 +496,11 @@ error_code _cellGcmInitBody(ppu_thread& ppu, vm::pptr<CellGcmContextData> contex
 	}
 #endif
 
+	// Upstream sets this at the top of _cellGcmInitBody. vm::falloc/vm::alloc below take vm::writer_lock, which throws
+	// without it ("vm::writer_lock is being used without cpu_flag::wait set by the caller", GTA IV 1.00); on PS4 the
+	// interrupt thread is created above through a guest call (ppu_execute) that returns with the flag cleared.
+	ppu.state += cpu_flag::wait;
+
 	gcm_cfg.current_config.ioAddress = 0;
 	gcm_cfg.current_config.localAddress = 0;
 	gcm_cfg.local_size = 0;
