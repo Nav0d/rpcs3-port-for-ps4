@@ -10,7 +10,10 @@ string(APPEND CMAKE_C_FLAGS_INIT " ${_llvm_sdk_options}")
 string(APPEND CMAKE_CXX_FLAGS_INIT " ${_llvm_sdk_options}")
 # Feature checks compile SDK code; dependencies are provided by the final
 # emulator link, and cannot be executed on this Windows build host.
-set(LLVM_TABLEGEN "${CMAKE_CURRENT_LIST_DIR}/.build-llvm-host/bin/llvm-tblgen.exe" CACHE FILEPATH "Native table generator")
+if(CMAKE_HOST_WIN32)
+    set(_llvm_host_exe .exe)
+endif()
+set(LLVM_TABLEGEN "${CMAKE_CURRENT_LIST_DIR}/.build-llvm-host/bin/llvm-tblgen${_llvm_host_exe}" CACHE FILEPATH "Native table generator")
 set(LLVM_TARGETS_TO_BUILD X86 CACHE STRING "Native JIT architecture")
 set(LLVM_HOST_TRIPLE x86_64-pc-freebsd12 CACHE STRING "Console JIT triple")
 set(LLVM_DEFAULT_TARGET_TRIPLE x86_64-pc-freebsd12 CACHE STRING "Console target triple")

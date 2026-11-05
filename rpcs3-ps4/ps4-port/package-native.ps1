@@ -61,7 +61,16 @@ if ($withLlvm) {
     }
 }
 $elf = Join-Path $buildPath 'ps4-port/rpcs3_ps4.elf'
-$tools = Join-Path $Sdk 'bin/windows'
+# The SDK ships the same tools per host OS; only the folder and the file names differ (macOS: x86_64, Rosetta 2)
+$hostExe = ''
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    $tools = Join-Path $Sdk 'bin/windows'; $hostExe = '.exe'; $createFself = 'create-fself.exe'
+} elseif ($IsMacOS) {
+    $tools = Join-Path $Sdk 'bin/macos'; $createFself = 'create-fself-macos'
+} else {
+    $tools = Join-Path $Sdk 'bin/linux'; $createFself = 'create-fself'
+}
+$pkgTool = "$tools/PkgTool.Core$hostExe"
 $work = Join-Path $PSScriptRoot '.build-native-package'
 $stage = Join-Path $work 'stage'
 $output = Join-Path $PSScriptRoot 'dist'
@@ -101,8 +110,8 @@ function Test-OelfDataCoverage([string]$ElfPath, [string]$OelfPath) {
 # reported as CE-34878-0. Reject an ELF whose fatal path still aborts, whose frontend still exits
 # by itself, or which kept musl's exit() instead of runtime/ps4_exit_guard.c.
 function Test-NativeExitPolicy([string]$ElfPath, [string]$FrontendObjects, [string]$ToolDir) {
-    $nmTool = Join-Path $ToolDir 'llvm-nm.exe'
-    $objdumpTool = Join-Path $ToolDir 'llvm-objdump.exe'
+    $nmTool = Join-Path $ToolDir "llvm-nm$hostExe"
+    $objdumpTool = Join-Path $ToolDir "llvm-objdump$hostExe"
     foreach ($tool in $nmTool, $objdumpTool) {
         if (!(Test-Path -LiteralPath $tool)) { throw "Exit-policy validation needs $tool (pass -LlvmTools <llvm bin directory>)" }
     }
@@ -356,7 +365,7 @@ $env:DOTNET_ROLL_FORWARD = 'Major'
 # create-fself records the input name in the module info, so pass it as a bare file name.
 Push-Location (Split-Path -Parent $elf)
 try {
-    Invoke-Checked "$tools/create-fself.exe" @('-in', (Split-Path -Leaf $elf), '--out', "$work/rpcs3.oelf", '--eboot', "$stage/eboot.bin", '--paid', '0x3800000000000011')
+    Invoke-Checked "$tools/$createFself" @('-in', (Split-Path -Leaf $elf), '--out', "$work/rpcs3.oelf", '--eboot', "$stage/eboot.bin", '--paid', '0x3800000000000011')
 }
 finally { Pop-Location }
 Test-OelfDataCoverage $elf "$work/rpcs3.oelf"
@@ -451,7 +460,7 @@ Copy-Item -LiteralPath "$PSScriptRoot/TESTAR_NO_PS4.txt" -Destination "$stage/TE
 Copy-Item -LiteralPath "$PSScriptRoot/TUTORIAL.txt" -Destination "$stage/TUTORIAL.txt"
 Push-Location $stage
 try {
-    Invoke-Checked "$tools/PkgTool.Core.exe" @('sfo_new', 'sce_sys/param.sfo')
+    Invoke-Checked $pkgTool @('sfo_new', 'sce_sys/param.sfo')
     $entries = @(
         @('APP_TYPE','Integer','4','1'), @('APP_VER','Utf8','8',$sfoVersion),
         @('ATTRIBUTE','Integer','4','0'), @('CATEGORY','Utf8','4','gd'),
@@ -459,12 +468,12 @@ try {
         @('SYSTEM_VER','Integer','4','0'), @('TITLE','Utf8','128',$appTitle),
         @('TITLE_ID','Utf8','12','RPCS30010'), @('VERSION','Utf8','8',$sfoVersion))
     foreach ($entry in $entries) {
-        Invoke-Checked "$tools/PkgTool.Core.exe" @('sfo_setentry','sce_sys/param.sfo',$entry[0],
+        Invoke-Checked $pkgTool @('sfo_setentry','sce_sys/param.sfo',$entry[0],
             '--type',$entry[1],'--maxsize',$entry[2],'--value',$entry[3])
     }
     $files = 'eboot.bin sce_sys/about/right.sprx sce_sys/param.sfo sce_sys/icon0.png sce_module/libc.prx sce_module/libSceFios2.prx fonts/DejaVuSans.ttf fonts/DejaVuSansMono.ttf LICENSE THIRD_PARTY_NOTICES.md build-manifest.json TESTAR_NO_PS4.txt TUTORIAL.txt'
     $files += ' ' + (($uiResources + $licenseResources + $databaseResources) -join ' ')
-    Invoke-Checked "$tools/create-gp4.exe" @('-out','native.gp4',"--content-id=$contentId",'--files',$files)
+    Invoke-Checked "$tools/create-gp4$hostExe" @('-out','native.gp4',"--content-id=$contentId",'--files',$files)
     # The SDK template lists only its sample directories. Add our font root
     # so the package builder can place the actual launcher resources.
     [xml]$project = Get-Content -LiteralPath 'native.gp4' -Raw
@@ -485,20 +494,20 @@ try {
         }
     }
     $project.Save((Join-Path $stage 'native.gp4'))
-    Invoke-Checked "$tools/PkgTool.Core.exe" @('pkg_build','native.gp4',$work)
+    Invoke-Checked $pkgTool @('pkg_build','native.gp4',$work)
 } finally { Pop-Location }
 $built = Join-Path $work "$contentId.pkg"
-Invoke-Checked "$tools/PkgTool.Core.exe" @('pkg_validate',$built)
+Invoke-Checked $pkgTool @('pkg_validate',$built)
 # Read back the package's actual filesystem and compare the embedded EBOOT.
 $verification = Join-Path $work "verify-$stamp"
-Invoke-Checked "$tools/PkgTool.Core.exe" @('pkg_extract',$built,$verification)
+Invoke-Checked $pkgTool @('pkg_extract',$built,$verification)
 $embeddedRoot = Join-Path $verification 'uroot'
 $embedded = (Get-FileHash "$embeddedRoot/eboot.bin" -Algorithm SHA256).Hash
 if ($embedded -ne $manifest.eboot_sha256) { throw 'Package contains a different EBOOT' }
 # Metadata lives in the PKG entry table, outside the extracted PFS uroot.
 # pkg_extractentry takes a table index; resolve it by name instead of using
 # fixed indices so changes to the SDK's table order cannot break validation.
-$packageEntries = & "$tools/PkgTool.Core.exe" pkg_listentries $built
+$packageEntries = & $pkgTool pkg_listentries $built
 if ($LASTEXITCODE) { throw 'Cannot read package metadata entries' }
 New-Item -ItemType Directory -Force "$verification/sce_sys" | Out-Null
 foreach ($metadata in @(@('ICON0_PNG','icon0.png'), @('PARAM_SFO','param.sfo'))) {
@@ -506,13 +515,13 @@ foreach ($metadata in @(@('ICON0_PNG','icon0.png'), @('PARAM_SFO','param.sfo')))
     $rows = @($packageEntries | Where-Object { $_ -match $pattern })
     if ($rows.Count -ne 1) { throw "Cannot locate package metadata: $($metadata[0])" }
     $index = [regex]::Match($rows[0], $pattern).Groups[1].Value
-    Invoke-Checked "$tools/PkgTool.Core.exe" @('pkg_extractentry', $built, $index, "$verification/sce_sys/$($metadata[1])")
+    Invoke-Checked $pkgTool @('pkg_extractentry', $built, $index, "$verification/sce_sys/$($metadata[1])")
 }
 # PkgTool adds PUBTOOLINFO/PUBTOOLVER to the embedded SFO. Compare every
 # user-supplied entry, allowing these generated publishing fields.
-$stagedSfo = & "$tools/PkgTool.Core.exe" sfo_listentries "$stage/sce_sys/param.sfo"
+$stagedSfo = & $pkgTool sfo_listentries "$stage/sce_sys/param.sfo"
 if ($LASTEXITCODE) { throw 'Cannot inspect staged SFO' }
-$embeddedSfo = & "$tools/PkgTool.Core.exe" sfo_listentries "$verification/sce_sys/param.sfo"
+$embeddedSfo = & $pkgTool sfo_listentries "$verification/sce_sys/param.sfo"
 if ($LASTEXITCODE) { throw 'Cannot inspect embedded SFO' }
 foreach ($entry in ($stagedSfo | Select-Object -Skip 1)) {
     if ($embeddedSfo -notcontains $entry) { throw "Package SFO entry differs: $entry" }

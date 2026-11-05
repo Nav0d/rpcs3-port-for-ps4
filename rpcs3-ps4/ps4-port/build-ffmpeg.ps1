@@ -8,6 +8,14 @@ param(
     [switch]$ConfigureOnly
 )
 $ErrorActionPreference = 'Stop'
+# macOS/Linux host: the system bash and GNU make, LLVM tools without .exe, ld.lld directly (curl.cmake and
+# native_link.cmake only build the rpcs3-ps4-ld.exe wrapper on Windows).
+$onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+$exe = if ($onWindows) { '.exe' } else { '' }
+if (!$onWindows) {
+    if (!$PSBoundParameters.ContainsKey('Bash')) { $Bash = '/bin/bash' }
+    if (!$PSBoundParameters.ContainsKey('Make')) { $Make = (Get-Command gmake, make -ErrorAction SilentlyContinue | Select-Object -First 1).Source }
+}
 $source = Join-Path $PSScriptRoot 'deps/ffmpeg'
 $revision = '239f2c733de417201d7ad3b3b8b0d9b63285b2b1' # FFmpeg n8.1.1
 if (!(Test-Path "$source/configure")) {
@@ -26,7 +34,7 @@ foreach ($library in 'libavcodec', 'libavutil', 'libavformat', 'libswscale', 'li
 $repo = (Resolve-Path "$PSScriptRoot/..").Path.Replace('\', '/')
 $sdkPath = (Resolve-Path $Sdk).Path.Replace('\', '/')
 $llvmPath = (Resolve-Path $Llvm).Path.Replace('\', '/')
-$linker = "$repo/ps4-port/.build-abi/ps4-port/rpcs3-ps4-ld.exe"
+$linker = if ($onWindows) { "$repo/ps4-port/.build-abi/ps4-port/rpcs3-ps4-ld.exe" } else { "$llvmPath/ld.lld" }
 if (!(Test-Path $linker)) { throw 'Build the rpcs3_ps4_linker target first' }
 New-Item -ItemType Directory -Force "$source/.ps4-tools" | Out-Null
 $utf8 = [System.Text.UTF8Encoding]::new($false)
@@ -55,12 +63,14 @@ Write-ToolFile 'ldflags.rsp' @"
 -Wl,--no-dynamic-linker
 -L "$sdkPath/lib"
 "@
-Write-ToolFile 'cc' "#!/usr/bin/env bash`nexec '$llvmPath/clang.exe' @.ps4-tools/cflags.rsp `"`$@`"`n"
-Write-ToolFile 'ld' "#!/usr/bin/env bash`nexec '$llvmPath/clang.exe' @.ps4-tools/cflags.rsp @.ps4-tools/ldflags.rsp `"`$@`" '$sdkPath/lib/crt1.o'`n"
+Write-ToolFile 'cc' "#!/usr/bin/env bash`nexec '$llvmPath/clang$exe' @.ps4-tools/cflags.rsp `"`$@`"`n"
+Write-ToolFile 'ld' "#!/usr/bin/env bash`nexec '$llvmPath/clang$exe' @.ps4-tools/cflags.rsp @.ps4-tools/ldflags.rsp `"`$@`" '$sdkPath/lib/crt1.o'`n"
 foreach ($tool in 'ar', 'ranlib', 'nm', 'strip') {
-    Write-ToolFile $tool "#!/usr/bin/env bash`nexec '$llvmPath/llvm-$tool.exe' `"`$@`"`n"
+    Write-ToolFile $tool "#!/usr/bin/env bash`nexec '$llvmPath/llvm-$tool$exe' `"`$@`"`n"
 }
-Write-ToolFile 'hostcc' "#!/usr/bin/env bash`nexec '$llvmPath/clang.exe' `"`$@`"`n"
+# Host tools built by configure run on the build machine: on macOS/Linux the system compiler finds its own SDK
+$hostCompiler = if ($onWindows) { "$llvmPath/clang.exe" } else { 'cc' }
+Write-ToolFile 'hostcc' "#!/usr/bin/env bash`nexec '$hostCompiler' `"`$@`"`n"
 # 0.33: the second decoder/demuxer lines and the pcm_mulaw/pcm_f32be encoders bring the component set closer to the
 # PC build. cellRec selects pcm_mulaw/pcm_f32be (video_encoder fails without them); media_utils (cellSearch, cellMusic)
 # opens flac/ogg/opus/wma/ac3/mp2/mkv/ts files. All are plain C in this tree (opus needs libswresample, built below);
@@ -91,13 +101,14 @@ if [[ "${RPCS3_PS4_CONFIGURE_ONLY:-0}" != 1 ]]; then
 fi
 '@
 Write-ToolFile 'build.sh' $build
-if (!(Test-Path $Make)) { throw 'Run ps4-port/prepare-make.ps1 to prepare MSYS GNU Make' }
+if (!$Make -or !(Test-Path $Make)) { throw 'Run ps4-port/prepare-make.ps1 to prepare MSYS GNU Make (macOS/Linux: install GNU make)' }
 $env:RPCS3_PS4_MAKE = (Resolve-Path $Make).Path.Replace('\', '/')
-$env:RPCS3_PS4_BASH = '/usr/bin/bash'
+# Inside MSYS bash the Git for Windows bash is /usr/bin/bash; elsewhere the -Bash path itself
+$env:RPCS3_PS4_BASH = if ($onWindows) { '/usr/bin/bash' } else { $Bash }
 $env:RPCS3_PS4_JOBS = "$Jobs"
 $env:RPCS3_PS4_CONFIGURE_ONLY = [int]$ConfigureOnly.IsPresent
 $previousPath = $env:PATH
-$env:PATH = "$(Split-Path $Bash);$env:PATH"
+$env:PATH = "$(Split-Path $Bash)$([IO.Path]::PathSeparator)$env:PATH"
 Push-Location $source
 try {
     & $Bash .ps4-tools/build.sh
