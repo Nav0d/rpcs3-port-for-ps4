@@ -19,8 +19,15 @@ if (!$onWindows) {
 $source = Join-Path $PSScriptRoot 'deps/ffmpeg'
 $revision = '239f2c733de417201d7ad3b3b8b0d9b63285b2b1' # FFmpeg n8.1.1
 if (!(Test-Path "$source/configure")) {
-    & git -c credential.interactive=never -c http.sslBackend=openssl clone --depth 1 --branch n8.1.1 https://github.com/FFmpeg/FFmpeg.git $source
-    if ($LASTEXITCODE) { throw 'FFmpeg checkout failed' }
+    # Ninja creates deps/ffmpeg/lib*/ for this command's outputs before running it, so on a fresh checkout the folder
+    # already exists and "git clone" refuses it. Fetch the tag into that folder instead.
+    New-Item -ItemType Directory -Force $source | Out-Null
+    & git -C $source init -q
+    if ($LASTEXITCODE) { throw 'FFmpeg checkout failed (git init)' }
+    & git -C $source -c credential.interactive=never -c http.sslBackend=openssl fetch -q --depth 1 https://github.com/FFmpeg/FFmpeg.git tag n8.1.1
+    if ($LASTEXITCODE) { throw 'FFmpeg checkout failed (git fetch)' }
+    & git -C $source checkout -q n8.1.1
+    if ($LASTEXITCODE) { throw 'FFmpeg checkout failed (git checkout)' }
 }
 $actual = & git -C $source rev-parse HEAD
 if ($LASTEXITCODE -or $actual -ne $revision) { throw "Unexpected FFmpeg revision: $actual" }
