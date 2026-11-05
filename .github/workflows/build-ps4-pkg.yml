@@ -114,12 +114,13 @@ jobs:
         working-directory: C:\b\src\rpcs3-ps4
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
+          # Every -D argument quoted: unquoted, PowerShell splits "-DX=a.b" at the dot ("-DX=a" ".b")
           cmake -S . -B ps4-port/.build-abi -G Ninja `
             "-DCMAKE_MAKE_PROGRAM=$PWD/ps4-port/.build-tools/ninja.exe" `
-            -DRPCS3_PS4_PORT=ON `
-            -DCMAKE_TOOLCHAIN_FILE=ps4-port/toolchain.cmake `
+            "-DRPCS3_PS4_PORT=ON" `
+            "-DCMAKE_TOOLCHAIN_FILE=ps4-port/toolchain.cmake" `
             "-DRPCS3_PS4_SDK=$env:SDK" "-DRPCS3_PS4_LLVM_BIN=$env:LLVM_BIN" `
-            -DRPCS3_PS4_WITH_LLVM=ON
+            "-DRPCS3_PS4_WITH_LLVM=ON"
           cmake --build ps4-port/.build-abi --target rpcs3_ps4_elf -j 4
 
       - name: Step 7 - EBOOT and PKG
