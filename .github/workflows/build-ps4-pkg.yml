@@ -1,0 +1,135 @@
+# Builds the PS4 package on a GitHub Windows runner, following BUILDING.md steps 4-7.
+# Started by a push to the gta4-gcm-fix branch or by hand (Actions tab -> "Build PS4 pkg" -> Run workflow).
+# The .pkg is attached to the run as the "rpcs3-ps4-pkg" artifact.
+name: Build PS4 pkg
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [gta4-gcm-fix]
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Short paths outside the workspace: LLVM build trees are deep and the workspace drive is small
+      SRC: C:\b\src
+      TOOLS: C:\b\tools
+      SDK: C:/b/tools/OpenOrbis/PS4Toolchain
+      LLVM_BIN: C:/b/tools/llvm-mingw-20240619-ucrt-x86_64/bin
+    steps:
+      - name: Disk space
+        run: Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n='FreeGB';e={[math]::Round($_.Free / 1GB, 1)}}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Sources (this commit, orbis-porting-kit, Mesa bundle)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          git config --global core.longpaths true
+          git init $env:SRC
+          git -C $env:SRC remote add origin "https://github.com/$env:GITHUB_REPOSITORY.git"
+          git -C $env:SRC fetch --depth 1 origin $env:GITHUB_SHA
+          git -C $env:SRC checkout --detach FETCH_HEAD
+          # BUILDING.md step 3 is not needed: this repository's HEAD already records 3rdparty/llvm/llvm
+          git -C $env:SRC ls-tree HEAD rpcs3-ps4/3rdparty/llvm/llvm
+
+          git clone https://github.com/orbis-ports/orbis-porting-kit.git "$env:SRC/orbis-porting-kit"
+          git -C "$env:SRC/orbis-porting-kit" checkout --detach 213b0c38ff25ea7ca402c8844a6494086d0f1cae
+
+          New-Item -ItemType Directory -Force $env:TOOLS, "$env:SRC/orbis-mesa-bundle" | Out-Null
+          curl.exe -fsSL -o "$env:TOOLS/mesa.tar.gz" https://github.com/orbis-ports/mesa-ps4/releases/download/orbis-mesa-4c934ebf9cda/orbis-mesa-4c934ebf9cda.tar.gz
+          # Python's tarfile copies the one symlink in the bundle where Windows cannot create it
+          python -c "import sys, tarfile; tarfile.open(sys.argv[1]).extractall(sys.argv[2], filter='tar')" "$env:TOOLS/mesa.tar.gz" "$env:SRC/orbis-mesa-bundle"
+          if (!(Test-Path "$env:SRC/orbis-mesa-bundle/orbis-mesa-4c934ebf9cda/build-orbis")) { throw 'Mesa bundle layout unexpected' }
+
+      - name: Tools (OpenOrbis v0.5.4, llvm-mingw 20240619, Ninja)
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          curl.exe -fsSL -o "$env:TOOLS/oo.tar.gz" https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz
+          tar -xzf "$env:TOOLS/oo.tar.gz" -C $env:TOOLS
+          curl.exe -fsSL -o "$env:TOOLS/llvm-mingw.zip" https://github.com/mstorsjo/llvm-mingw/releases/download/20240619/llvm-mingw-20240619-ucrt-x86_64.zip
+          tar -xf "$env:TOOLS/llvm-mingw.zip" -C $env:TOOLS
+          curl.exe -fsSL -o "$env:TOOLS/ninja.zip" https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip
+          New-Item -ItemType Directory -Force "$env:SRC/rpcs3-ps4/ps4-port/.build-tools" | Out-Null
+          tar -xf "$env:TOOLS/ninja.zip" -C "$env:SRC/rpcs3-ps4/ps4-port/.build-tools"
+          foreach ($f in "$env:SDK/bin/windows/create-fself.exe", "$env:SDK/link.x", "$env:LLVM_BIN/clang.exe", "$env:SRC/rpcs3-ps4/ps4-port/.build-tools/ninja.exe") {
+            if (!(Test-Path $f)) { throw "missing $f" }
+          }
+          & "$env:LLVM_BIN/clang.exe" --version
+          cmake --version
+
+      - name: LLVM cache key
+        id: llvmkey
+        run: |
+          $p = "$env:SRC/rpcs3-ps4/ps4-port"
+          $files = 'build-llvm.ps1', 'fetch-llvm.py', 'prepare-llvm.py', 'llvm-toolchain.cmake', 'llvm-native.cmake' | ForEach-Object { "$p/$_" } | Where-Object { Test-Path $_ }
+          $joined = ($files | ForEach-Object { (Get-FileHash $_ -Algorithm SHA256).Hash }) -join ''
+          $hash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($joined))).Replace('-', '').Substring(0, 16)
+          "key=llvm-ca7933e4-$hash" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/cache@v4
+        with:
+          key: ${{ steps.llvmkey.outputs.key }}
+          path: |
+            C:\b\src\rpcs3-ps4\ps4-port\deps\llvm-project-ca7933e47d3a3451d81e72ac174dcb5aa28b59d1
+            C:\b\src\rpcs3-ps4\ps4-port\deps\llvm-project-ca7933e47d3a3451d81e72ac174dcb5aa28b59d1.tar.gz
+            C:\b\src\rpcs3-ps4\ps4-port\.build-llvm-host
+            C:\b\src\rpcs3-ps4\ps4-port\.build-llvm-orbis
+
+      - name: Step 4 - pinned dependencies (Abseil, GNU Make)
+        working-directory: C:\b\src\rpcs3-ps4
+        run: |
+          ./ps4-port/prepare-abseil.ps1
+          ./ps4-port/prepare-make.ps1
+
+      - name: Step 5 - console LLVM
+        working-directory: C:\b\src\rpcs3-ps4
+        run: ./ps4-port/build-llvm.ps1 -Sdk $env:SDK -CompilerBin $env:LLVM_BIN -Jobs 4
+
+      - name: Step 6 - configure and build the native ELF
+        working-directory: C:\b\src\rpcs3-ps4
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -S . -B ps4-port/.build-abi -G Ninja `
+            "-DCMAKE_MAKE_PROGRAM=$PWD/ps4-port/.build-tools/ninja.exe" `
+            -DRPCS3_PS4_PORT=ON `
+            -DCMAKE_TOOLCHAIN_FILE=ps4-port/toolchain.cmake `
+            "-DRPCS3_PS4_SDK=$env:SDK" "-DRPCS3_PS4_LLVM_BIN=$env:LLVM_BIN" `
+            -DRPCS3_PS4_WITH_LLVM=ON
+          cmake --build ps4-port/.build-abi --target rpcs3_ps4_elf -j 4
+
+      - name: Step 7 - EBOOT and PKG
+        working-directory: C:\b\src\rpcs3-ps4
+        run: |
+          $Version = [regex]::Match((Get-Content rpcs3/util/ps4_build_version.hpp -Raw), 'ps4_build_version\[\]\s*=\s*"([0-9]+\.[0-9]{2})"').Groups[1].Value
+          ./ps4-port/package-native.ps1 -Sdk $env:SDK -LlvmTools $env:LLVM_BIN -Version $Version
+          Get-ChildItem ps4-port/dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rpcs3-ps4-pkg
+          path: |
+            C:\b\src\rpcs3-ps4\ps4-port\dist\*.pkg
+            C:\b\src\rpcs3-ps4\ps4-port\dist\*.sha256
+            C:\b\src\rpcs3-ps4\ps4-port\dist\build-manifest-*.json
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            C:\b\src\rpcs3-ps4\ps4-port\.build-abi\CMakeFiles\CMakeOutput.log
+            C:\b\src\rpcs3-ps4\ps4-port\.build-abi\CMakeFiles\CMakeError.log
+            C:\b\src\rpcs3-ps4\ps4-port\.build-abi\CMakeFiles\CMakeConfigureLog.yaml
+            C:\b\src\rpcs3-ps4\ps4-port\.build-llvm-orbis\CMakeFiles\CMakeConfigureLog.yaml
+          if-no-files-found: ignore

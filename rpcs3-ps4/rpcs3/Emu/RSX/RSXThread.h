@@ -236,6 +236,13 @@ namespace rsx
 		bool isHLE{ false };
 		bool serialized = false;
 
+#ifdef RPCS3_PS4
+		// The pushbuffer is in RSX local memory: GET, PUT, JUMP, CALL and RETURN are local memory offsets instead of
+		// IO offsets. libgcm builds its command buffer there when its init entry NID 0xB70B4AD3 gets 0 as 5th
+		// argument (GTA IV, SDK 2.10). Set by the cellGcmSys HLE of that entry (cellGcmSys_B70B4AD3), never by LLE.
+		bool ps4_fifo_in_local_mem = false;
+#endif
+
 		u32 flip_status = CELL_GCM_DISPLAY_FLIP_STATUS_DONE;
 		int debug_level = CELL_GCM_DEBUG_LEVEL0;
 

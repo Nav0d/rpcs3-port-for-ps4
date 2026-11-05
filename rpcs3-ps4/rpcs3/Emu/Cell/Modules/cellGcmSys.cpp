@@ -392,10 +392,79 @@ u32 g_defaultCommandBufferBegin, g_defaultCommandBufferFragmentCount;
 extern bool ps4_test_refuse_hle_thread(std::string_view name);
 #endif
 
+#ifdef RPCS3_PS4
+static error_code gcm_init_body(ppu_thread& ppu, vm::pptr<CellGcmContextData> context, u32 cmdSize, u32 ioSize, u32 ioAddress, bool local_cmd_buffer);
+
 // Called by cellGcmInit
 error_code _cellGcmInitBody(ppu_thread& ppu, vm::pptr<CellGcmContextData> context, u32 cmdSize, u32 ioSize, u32 ioAddress)
 {
 	cellGcmSys.warning("_cellGcmInitBody(context=**0x%x, cmdSize=0x%x, ioSize=0x%x, ioAddress=0x%x)", context, cmdSize, ioSize, ioAddress);
+	return gcm_init_body(ppu, context, cmdSize, ioSize, ioAddress, false);
+}
+
+// cellGcmSys NID 0xB70B4AD3 (no known name), imported by GTA IV BLES00229 1.00 (SDK 2.10). In libgcm_sys.sprx this
+// export is one instruction placed right before _cellGcmInitBody: "b <init>", while _cellGcmInitBody is
+// "li r7, 1; b <init>". Same r3-r6 (context, cmdSize, ioSize, ioAddress), plus r7 that _cellGcmInitBody fixes at 1.
+// What the shared init does with r7 == 0:
+// - sys_rsx_context_allocate gets system_mode | 0x10;
+// - ioSize and ioAddress are ignored and nothing is mapped to IO (no sys_rsx_context_iomap); the game maps its IO
+//   memory itself afterwards (GTA IV: cellGcmMapEaIoAddress(ea=0x30000000, io=0, size=0xb300000));
+// - the command buffer starts at the beginning of RSX local memory, so GET/PUT are local offsets (GET = PUT = 0x1000
+//   at start, the first 4 KiB stay reserved like in IO mode);
+// - only cmdSize > 0xffff and cmdSize % 4 == 0 are checked (CELL_GCM_ERROR_FAILURE otherwise);
+// - cellGcmGetConfiguration keeps reporting the whole local memory, nothing is subtracted for the command buffer.
+// r7 != 0 behaves exactly like _cellGcmInitBody.
+error_code cellGcmSys_B70B4AD3(ppu_thread& ppu, vm::pptr<CellGcmContextData> context, u32 cmdSize, u32 ioSize, u32 ioAddress, u32 mapIo)
+{
+	cellGcmSys.warning("cellGcmSys_B70B4AD3(context=**0x%x, cmdSize=0x%x, ioSize=0x%x, ioAddress=0x%x, mapIo(r7)=0x%x) LR=0x%x: %s",
+		context, cmdSize, ioSize, ioAddress, mapIo, ppu.lr, mapIo ? "same as _cellGcmInitBody" : "command buffer in RSX local memory, no IO map");
+
+	// The caller's code before the call, so the next RPCS3.log shows how the game set up r3-r7
+	if (const u32 lr = static_cast<u32>(ppu.lr) & ~3u; lr >= 0x40 && vm::check_addr(lr - 0x40, vm::page_readable, 0x40))
+	{
+		std::string words;
+		for (u32 addr = lr - 0x40; addr < lr; addr += 4)
+		{
+			fmt::append(words, " %08x", static_cast<u32>(vm::read32(addr)));
+		}
+
+		cellGcmSys.warning("cellGcmSys_B70B4AD3(): caller code 0x%x..0x%x (the last word is the bl):%s", lr - 0x40, lr - 4, words);
+	}
+
+	error_code result = CELL_OK;
+
+	if (mapIo)
+	{
+		result = gcm_init_body(ppu, context, cmdSize, ioSize, ioAddress, false);
+	}
+	else if (cmdSize <= 0xffff || cmdSize % 4)
+	{
+		// Same checks libgcm makes in this mode, before anything is set up here
+		cellGcmSys.error("cellGcmSys_B70B4AD3(): invalid cmdSize=0x%x (must be > 0xffff and a multiple of 4)", cmdSize);
+		result = CELL_GCM_ERROR_FAILURE;
+	}
+	else
+	{
+		result = gcm_init_body(ppu, context, cmdSize, ioSize, ioAddress, true);
+	}
+
+	const auto& gcm_cfg = g_fxo->get<gcm_config>();
+	cellGcmSys.warning("cellGcmSys_B70B4AD3() -> 0x%x; command buffer begin=0x%x end=0x%x (%u x 32 KiB), control=0x%x, labels=0x%x, RSX FIFO in %s memory",
+		static_cast<u32>(static_cast<s32>(result)), gcm_cfg.current_context.begin.addr(), gcm_cfg.current_context.end.addr(), g_defaultCommandBufferFragmentCount,
+		gcm_cfg.gcm_info.control_addr, rsx::get_current_renderer()->label_addr, rsx::get_current_renderer()->ps4_fifo_in_local_mem ? "local" : "IO");
+
+	return result;
+}
+
+static error_code gcm_init_body(ppu_thread& ppu, vm::pptr<CellGcmContextData> context, u32 cmdSize, u32 ioSize, u32 ioAddress, bool local_cmd_buffer)
+#else
+// Called by cellGcmInit
+error_code _cellGcmInitBody(ppu_thread& ppu, vm::pptr<CellGcmContextData> context, u32 cmdSize, u32 ioSize, u32 ioAddress)
+#endif
+{
+#ifndef RPCS3_PS4
+	cellGcmSys.warning("_cellGcmInitBody(context=**0x%x, cmdSize=0x%x, ioSize=0x%x, ioAddress=0x%x)", context, cmdSize, ioSize, ioAddress);
+#endif
 
 	auto& gcm_cfg = g_fxo->get<gcm_config>();
 	auto lock = lv2_host_lock(gcm_cfg.gcmio_mutex);
@@ -441,6 +510,18 @@ error_code _cellGcmInitBody(ppu_thread& ppu, vm::pptr<CellGcmContextData> contex
 
 	cellGcmSys.warning("*** local memory(addr=0x%x, size=0x%x)", gcm_cfg.local_addr, gcm_cfg.local_size);
 
+#ifdef RPCS3_PS4
+	// cellGcmSys_B70B4AD3 with r7 == 0: libgcm ignores ioSize/ioAddress, maps nothing to IO and builds the command
+	// buffer at the start of local memory (the game maps its IO memory itself afterwards)
+	if (local_cmd_buffer)
+	{
+		ioSize = 0;
+		ioAddress = 0;
+	}
+
+	const u32 cmd_buffer_addr = local_cmd_buffer ? gcm_cfg.local_addr : ioAddress;
+#endif
+
 	InitOffsetTable();
 
 	const auto render = rsx::get_current_renderer();
@@ -459,9 +540,24 @@ error_code _cellGcmInitBody(ppu_thread& ppu, vm::pptr<CellGcmContextData> contex
 	render->local_mem_size = gcm_cfg.local_size;
 
 	ensure(sys_rsx_device_map(ppu, vm::var<u64>{}, vm::null, 0x8) == CELL_OK);
+#ifdef RPCS3_PS4
+	// libgcm adds 0x10 to the system mode in this mode (only stored in the driver info and logged here)
+	ensure(sys_rsx_context_allocate(ppu, vm::var<u32>{}, vm::var<u64>{}, vm::var<u64>{}, vm::var<u64>{}, 0, gcm_cfg.system_mode | (local_cmd_buffer ? 0x10 : 0)) == CELL_OK);
+
+	// Before the game can write PUT: from now on the RSX reads the FIFO from local memory
+	render->ps4_fifo_in_local_mem = local_cmd_buffer;
+
+	if (local_cmd_buffer)
+	{
+		cellGcmSys.warning("cellGcmInit(): command buffer at local memory 0x%x, no IO mapped; the RSX FIFO now uses local memory offsets", cmd_buffer_addr);
+	}
+
+	if (!local_cmd_buffer && gcmMapEaIoAddress(ppu, ioAddress, 0, ioSize, false) != CELL_OK)
+#else
 	ensure(sys_rsx_context_allocate(ppu, vm::var<u32>{}, vm::var<u64>{}, vm::var<u64>{}, vm::var<u64>{}, 0, gcm_cfg.system_mode) == CELL_OK);
 
 	if (gcmMapEaIoAddress(ppu, ioAddress, 0, ioSize, false) != CELL_OK)
+#endif
 	{
 #ifdef RPCS3_PS4
 		// The RSX context is already running at this point. Give it the interrupt thread anyway so a game that
@@ -483,7 +579,11 @@ error_code _cellGcmInitBody(ppu_thread& ppu, vm::pptr<CellGcmContextData> contex
 	const u32 rsx_ctxaddr = render->device_addr;
 	ensure(rsx_ctxaddr);
 
+#ifdef RPCS3_PS4
+	g_defaultCommandBufferBegin = cmd_buffer_addr;
+#else
 	g_defaultCommandBufferBegin = ioAddress;
+#endif
 	g_defaultCommandBufferFragmentCount = cmdSize / (32 * 1024);
 
 	gcm_cfg.gcm_info.context_addr = rsx_ctxaddr;
@@ -1095,6 +1195,19 @@ error_code gcmMapEaIoAddress(ppu_thread& ppu, u32 ea, u32 io, u32 size, bool is_
 	}
 
 	gcm_cfg.IoMapTable[ea] = size;
+
+#ifdef RPCS3_PS4
+	// cellGcmSys_B70B4AD3 with r7 == 0 maps no IO at init, so the game's own first map of IO 0 is what libgcm's
+	// cellGcmGetConfiguration reports as ioAddress/ioSize (it reads them from its IO 0 tables)
+	if (io == 0 && !gcm_cfg.current_config.ioSize && rsx::get_current_renderer()->ps4_fifo_in_local_mem)
+	{
+		gcm_cfg.current_config.ioAddress = ea << 20;
+		gcm_cfg.current_config.ioSize = size << 20;
+		cellGcmSys.warning("gcmMapEaIoAddress(): IO 0 mapped by the game (local memory command buffer): configuration ioAddress=0x%x ioSize=0x%x",
+			ea << 20, size << 20);
+	}
+#endif
+
 	return CELL_OK;
 }
 
@@ -1490,6 +1603,14 @@ static std::pair<u32, u32> getNextCommandBufferBeginEnd(u32 current)
 
 static u32 getOffsetFromAddress(u32 address)
 {
+#ifdef RPCS3_PS4
+	// Command buffer in local memory (cellGcmSys_B70B4AD3 with r7 == 0): the FIFO uses local memory offsets
+	if (const auto& cfg = g_fxo->get<gcm_config>(); rsx::get_current_renderer()->ps4_fifo_in_local_mem && address - cfg.local_addr < cfg.local_size)
+	{
+		return address - cfg.local_addr;
+	}
+#endif
+
 	const u32 upper = g_fxo->get<gcm_config>().offsetTable.ioAddress[address >> 20]; // 12 bits
 	ensure(upper != 0xFFFF);
 	return (upper << 20) | (address & 0xFFFFF);
@@ -1592,6 +1713,9 @@ DECLARE(ppu_module_manager::cellGcmSys)("cellGcmSys", []()
 	REG_FUNC(cellGcmSys, _cellGcmFunc1);
 	REG_FUNC(cellGcmSys, _cellGcmFunc15);
 	REG_FUNC(cellGcmSys, _cellGcmInitBody);
+#ifdef RPCS3_PS4
+	REG_FNID(cellGcmSys, 0xB70B4AD3, cellGcmSys_B70B4AD3); // _cellGcmInitBody with the r7 mode argument (GTA IV, SDK 2.10)
+#endif
 	REG_FUNC(cellGcmSys, cellGcmInitSystemMode);
 	REG_FUNC(cellGcmSys, cellGcmResetFlipStatus);
 	REG_FUNC(cellGcmSys, cellGcmResetFlipStatus2);

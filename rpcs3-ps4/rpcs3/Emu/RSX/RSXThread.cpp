@@ -417,7 +417,9 @@ namespace rsx
 
 		const u32 get = rsx->fifo_ctrl ? rsx->fifo_ctrl->get_pos() : 0;
 		const u32 put = rsx->ctrl ? static_cast<u32>(rsx->ctrl->put.load()) : 0;
-		const u32 get_ea = rsx->iomap_table.get_addr(get);
+		// Through the FIFO's own translation: IO map, or local memory for the NID 0xB70B4AD3 command buffer
+		const u32 get_ea = rsx->fifo_ctrl ? rsx->fifo_ctrl->translate_address(get) : rsx->iomap_table.get_addr(get);
+		const char* const fifo_space = rsx->ps4_fifo_in_local_mem ? "LOCAL" : "IO";
 
 		u32 mapped = 0;
 		std::string first;
@@ -437,8 +439,8 @@ namespace rsx
 			mode = fmt::format("0x%x", static_cast<u32>(vm::get_super_ptr<RsxDriverInfo>(rsx->driver_info)->systemModeFlags));
 		}
 
-		return fmt::format("get=0x%x put=0x%x (IO 0x%x %s), last cmd 0x%x; IO map: %u MiB mapped, IO 0 %s;%s system mode %s; %s",
-			get, put, get, get_ea == umax ? "not mapped" : fmt::format("-> ea 0x%x", get_ea), rsx->fifo_ctrl ? rsx->fifo_ctrl->last_cmd() : 0,
+		return fmt::format("get=0x%x put=0x%x (%s 0x%x %s), last cmd 0x%x; IO map: %u MiB mapped, IO 0 %s;%s system mode %s; %s",
+			get, put, fifo_space, get, get_ea == umax ? "not mapped" : fmt::format("-> ea 0x%x", get_ea), rsx->fifo_ctrl ? rsx->fifo_ctrl->last_cmd() : 0,
 			mapped, rsx->iomap_table.get_addr(0) == umax ? "not mapped" : "mapped", first, mode, ps4_sys_rsx_ring_text());
 	}
 
@@ -488,16 +490,16 @@ namespace rsx
 			return;
 		}
 
-		// 64 command words around GET (32 before it), read through the IO map with the unprotected view; '?' = not
-		// mapped or not readable. '>' marks GET.
+		// 64 command words around GET (32 before it), read through the FIFO's translation (IO map, or local memory for
+		// the NID 0xB70B4AD3 command buffer) with the unprotected view; '?' = not mapped or not readable. '>' marks GET.
 		const u32 start = (get & ~3u) >= 32 * 4 ? (get & ~3u) - 32 * 4 : 0;
 		for (u32 line = 0; line < 4; line++)
 		{
-			std::string words = fmt::format("RSX: %s: words at IO 0x%x:", what, start + line * 64);
+			std::string words = fmt::format("RSX: %s: words at %s 0x%x:", what, rsx->ps4_fifo_in_local_mem ? "LOCAL" : "IO", start + line * 64);
 			for (u32 w = 0; w < 16; w++)
 			{
 				const u32 io = start + (line * 16 + w) * 4;
-				const u32 ea = rsx->iomap_table.get_addr(io);
+				const u32 ea = rsx->fifo_ctrl ? rsx->fifo_ctrl->translate_address(io) : rsx->iomap_table.get_addr(io);
 				const char* mark = io == (get & ~3u) ? " >" : " ";
 
 				if (ea == umax || !vm::check_addr(ea, vm::page_readable, 4))
